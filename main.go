@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/gravwell/ingest"
@@ -36,7 +37,7 @@ const (
 
 var (
 	buffSize = flag.Int("file-buff-size", 16, "Size in megabytes for the file buffer")
-	srcOvr   = flag.Uint64("source-override", 0, "Override source with an ID")
+	srcOvr   = flag.String("source-override", ``, "Override source with an ID")
 	status   = flag.Bool("status", false, "Output ingest rate stats as we go")
 	fileinfo = flag.Bool("fileinfo", false, "Print file name as we process them")
 	inFile   = flag.String("i", "", "Input file list to process")
@@ -60,9 +61,11 @@ func init() {
 	if *inFile == "" {
 		log.Fatal("Input file path required")
 	}
-	//if not overriding, then make an empty has
-	if *srcOvr == 0 {
-		srcOverride = net.IP(make([]byte, 16))
+	if *srcOvr != `` {
+		var err error
+		if srcOverride, err = utils.ParseSource(*srcOvr); err != nil {
+			log.Fatalf("Invalid source: %v", err)
+		}
 	}
 	if *buffSize <= 0 {
 		fbuff = 4 * 1024 * 1024
@@ -175,10 +178,19 @@ loop:
 }
 
 func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) error {
-	brdr := bufio.NewReader(flist)
+	var src net.IP
+	var err error
 	var i int
+	if src, err = igst.SourceIP(); err != nil {
+		return err
+	}
+	if srcOverride != nil {
+		src = srcOverride
+	}
+	brdr := bufio.NewReader(flist)
 	for {
 		i++
+		lsrc := src
 		ln, isPrefix, err := brdr.ReadLine()
 		if err != nil {
 			if err == io.EOF {
@@ -190,6 +202,16 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) 
 			log.Printf("File list line %d is too long, skipping\n", i)
 			continue
 		}
+		//attempt to split the file, check for a src override hash
+		if bits := strings.Split(string(ln), "\t"); len(bits) == 2 {
+			ln = []byte(bits[0])
+			//attempt to parse the source override as a hash
+			if lsrc, err = utils.ParseSource(bits[1]); err != nil {
+				log.Println("Failed to parse source override", bits[1])
+				lsrc = src
+			}
+		}
+
 		if *fileinfo {
 			log.Println("Processing", string(ln))
 		}
@@ -204,7 +226,7 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) 
 			return err
 		}
 
-		if err = packetReader(hnd, igst, tag); err != nil {
+		if err = packetReader(hnd, igst, tag, lsrc); err != nil {
 			log.Printf("Failed to ingest %s: %v\n", ln, err)
 			fi.Close()
 			return err
@@ -217,18 +239,14 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) 
 	return nil
 }
 
-func packetReader(hnd *pcap.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) error {
-	//get the src
-	src, err := igst.SourceIP()
-	if err != nil {
-		return err
-	}
+func packetReader(hnd *pcap.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, src net.IP) error {
 	var sec int64
 	var lSize uint64
 	var ts entry.Timestamp
 	var dt []byte
 	var ci gopacket.CaptureInfo
 	var blk []*entry.Entry
+	var err error
 
 	//get packet src
 	for {
