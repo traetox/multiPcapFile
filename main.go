@@ -215,31 +215,25 @@ func ingestFiles(flist io.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag) 
 		if *fileinfo {
 			log.Println("Processing", string(ln))
 		}
-		fi, err := utils.OpenBufferedFileReader(string(ln), fbuff)
+		ph, err := newPacketReader(string(ln), fbuff)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to open pcap file: %v\n", err)
 			return err
 		}
-		hnd, err := pcap.NewReader(fi)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open pcap Reader: %v\n", err)
-			return err
-		}
-
-		if err = packetReader(hnd, igst, tag, lsrc); err != nil {
+		if err = packetReader(ph, igst, tag, lsrc); err != nil {
 			log.Printf("Failed to ingest %s: %v\n", ln, err)
-			fi.Close()
+			ph.Close()
 			return err
 		}
 
-		if err = fi.Close(); err != nil {
+		if err = ph.Close(); err != nil {
 			log.Printf("Failed to close %s: %v\n", ln, err)
 		}
 	}
 	return nil
 }
 
-func packetReader(hnd *pcap.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag, src net.IP) error {
+func packetReader(hnd *packetHandle, igst *ingest.IngestMuxer, tag entry.EntryTag, src net.IP) error {
 	var sec int64
 	var lSize uint64
 	var ts entry.Timestamp
@@ -284,4 +278,59 @@ func packetReader(hnd *pcap.Reader, igst *ingest.IngestMuxer, tag entry.EntryTag
 		}
 	}
 	return nil
+}
+
+type packetHandle struct {
+	fi     io.ReadCloser
+	ngMode bool
+	hnd    *pcap.Reader
+	nghnd  *pcap.NgReader
+}
+
+func newPacketReader(pth string, buff int) (ph *packetHandle, err error) {
+	var fi io.ReadCloser
+	var hnd *pcap.Reader
+	var nghnd *pcap.NgReader
+	if fi, err = utils.OpenBufferedFileReader(pth, buff); err != nil {
+		return
+	}
+
+	//attempt to open a standard reader
+	if hnd, err = pcap.NewReader(fi); err == nil {
+		ph = &packetHandle{
+			fi:  fi,
+			hnd: hnd,
+		}
+		return
+	}
+
+	//failed, retry as an ng reader
+	if err = fi.Close(); err != nil {
+		return
+	} else if fi, err = utils.OpenBufferedFileReader(pth, buff); err != nil {
+		return
+	}
+
+	if nghnd, err = pcap.NewNgReader(fi, pcap.NgReaderOptions{}); err != nil {
+		return
+	}
+	ph = &packetHandle{
+		fi:     fi,
+		nghnd:  nghnd,
+		ngMode: true,
+	}
+	return
+}
+
+func (ph *packetHandle) Close() error {
+	return ph.fi.Close()
+}
+
+func (ph *packetHandle) ReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
+	if ph.ngMode {
+		data, ci, err = ph.nghnd.ReadPacketData()
+	} else {
+		data, ci, err = ph.hnd.ReadPacketData()
+	}
+	return
 }
